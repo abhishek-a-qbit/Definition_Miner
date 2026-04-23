@@ -26,10 +26,14 @@ USER_AGENT = (
 )
 TRIGGER_PHRASES = (
     " is a ",
+    " is an ",
+    " is the ",
+    " are ",
     " refers to ",
     " defined as ",
     " stands for ",
     " means ",
+    " describes ",
 )
 BLACKLIST_SNIPPETS = (
     "cookie",
@@ -44,11 +48,27 @@ AUTHORITY_DOMAINS = {
     "wikipedia.org",
     "gartner.com",
     "forrester.com",
+    "mckinsey.com",
+    "investopedia.com",
+    "britannica.com",
+    "hbr.org",
+    "oecd.org",
+    "worldbank.org",
+    "imf.org",
+    "who.int",
+}
+VENDOR_DOMAINS = {
     "salesforce.com",
     "hubspot.com",
     "oracle.com",
-    "mckinsey.com",
-    "investopedia.com",
+    "microsoft.com",
+    "adobe.com",
+    "zoho.com",
+    "sap.com",
+    "servicenow.com",
+    "freshworks.com",
+    "pipedrive.com",
+    "mailchimp.com",
 }
 
 
@@ -79,6 +99,7 @@ class Config:
     use_cache: bool
     cache_db_path: Path
     cache_ttl_days: int
+    source_policy: str
     min_words: int
     max_words: int
     similarity_threshold: float
@@ -106,6 +127,20 @@ def normalize_url(url: str) -> str:
     parsed = urlparse(url)
     cleaned = parsed._replace(fragment="", query=parsed.query)
     return cleaned.geturl().rstrip("/")
+
+
+def domain_matches(domain: str, roots: Sequence[str]) -> bool:
+    return any(domain == root or domain.endswith(f".{root}") for root in roots)
+
+
+def is_authority_domain(domain: str) -> bool:
+    if domain.endswith(".gov") or domain.endswith(".edu"):
+        return True
+    return domain_matches(domain, AUTHORITY_DOMAINS)
+
+
+def is_vendor_domain(domain: str) -> bool:
+    return domain_matches(domain, VENDOR_DOMAINS)
 
 
 def search_duckduckgo_html(query: str, limit: int, timeout_seconds: int) -> List[str]:
@@ -356,6 +391,12 @@ def search_urls(category: str, cfg: Config) -> List[str]:
             normalized = normalize_url(raw_url)
             if normalized in seen:
                 continue
+
+            domain = get_domain(normalized)
+            if cfg.source_policy == "authority_only":
+                if not is_authority_domain(domain) or is_vendor_domain(domain):
+                    continue
+
             seen.add(normalized)
             ordered_urls.append(normalized)
             if len(ordered_urls) >= cfg.max_urls:
@@ -497,22 +538,46 @@ def split_sentences(block: str) -> List[str]:
     return [clean_text(part) for part in parts if part.strip()]
 
 
+def category_terms(category: str) -> List[str]:
+    category_clean = clean_text(category)
+    terms = {category_clean.lower()}
+
+    words = re.findall(r"[A-Za-z]+", category_clean)
+    if len(words) >= 2:
+        acronym = "".join(word[0] for word in words).lower()
+        if 2 <= len(acronym) <= 10:
+            terms.add(acronym)
+
+    if category_clean.isalpha() and category_clean.isupper() and 2 <= len(category_clean) <= 10:
+        terms.add(category_clean.lower())
+
+    return sorted(terms)
+
+
+def sentence_has_any_term(sentence: str, terms: Sequence[str]) -> bool:
+    for term in terms:
+        pattern = rf"\b{re.escape(term)}\b"
+        if re.search(pattern, sentence):
+            return True
+    return False
+
+
 def looks_like_definition(sentence: str, category: str) -> bool:
     lowered = f" {sentence.lower()} "
-    category_lower = category.lower()
-    if category_lower not in lowered:
+    terms = category_terms(category)
+    if not sentence_has_any_term(lowered, terms):
         return False
     if any(snippet in lowered for snippet in BLACKLIST_SNIPPETS):
         return False
     if any(trigger in lowered for trigger in TRIGGER_PHRASES):
         return True
 
-    pattern = rf"\b{re.escape(category_lower)}\b.*\b(is|refers to|defined as|means|stands for)\b"
-    if re.search(pattern, lowered):
-        return True
+    for term in terms:
+        pattern = rf"\b{re.escape(term)}\b.*\b(is|refers to|defined as|means|stands for)\b"
+        if re.search(pattern, lowered):
+            return True
 
-    acronym_pattern = rf"\b{re.escape(category.upper())}\b\s*\(([^)]+)\)"
-    return bool(re.search(acronym_pattern, sentence))
+    return False
 
 
 def extract_candidates_from_html(html: str, url: str, category: str, cfg: Config) -> List[Candidate]:
@@ -520,19 +585,29 @@ def extract_candidates_from_html(html: str, url: str, category: str, cfg: Config
     seen_sentences = set()
     candidates: List[Candidate] = []
 
-    for block in extract_blocks(html):
-        for sentence in split_sentences(block):
-            words = sentence.split()
-            if len(words) < cfg.min_words or len(words) > cfg.max_words:
-                continue
-            if not looks_like_definition(sentence, category):
-                continue
+    blocks = extract_blocks(html)
 
-            dedup_key = sentence.lower()
-            if dedup_key in seen_sentences:
-                continue
-            seen_sentences.add(dedup_key)
-            candidates.append(Candidate(sentence=sentence, url=url, domain=domain))
+    def collect(min_words: int, max_words: int) -> None:
+        for block in blocks:
+            for sentence in split_sentences(block):
+                words = sentence.split()
+                if len(words) < min_words or len(words) > max_words:
+                    continue
+                if not looks_like_definition(sentence, category):
+                    continue
+
+                dedup_key = sentence.lower()
+                if dedup_key in seen_sentences:
+                    continue
+                seen_sentences.add(dedup_key)
+                candidates.append(Candidate(sentence=sentence, url=url, domain=domain))
+
+    collect(cfg.min_words, cfg.max_words)
+
+    if not candidates:
+        relaxed_min_words = max(6, min(cfg.min_words, 10))
+        relaxed_max_words = max(cfg.max_words, 180)
+        collect(relaxed_min_words, relaxed_max_words)
 
     return candidates
 
@@ -588,9 +663,7 @@ def cluster_candidates(candidates: Sequence[Candidate], cfg: Config) -> List[Clu
         representative = deduped[representative_global_idx]
         centrality = float(centralities[representative_local_idx])
 
-        authority_count = sum(
-            1 for domain in domains if any(domain.endswith(a) for a in AUTHORITY_DOMAINS)
-        )
+        authority_count = sum(1 for domain in domains if is_authority_domain(domain))
         score = len(domains) + 0.35 * centrality + 0.15 * authority_count
 
         urls = sorted({deduped[i].url for i in indices})
@@ -695,6 +768,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-cache", action="store_true", help="Disable SQLite HTML caching.")
     parser.add_argument("--cache-db-path", default=".cache/definition_miner.sqlite")
     parser.add_argument("--cache-ttl-days", type=int, default=14)
+    parser.add_argument(
+        "--source-policy",
+        choices=["all", "authority_only"],
+        default="all",
+        help="all = include any domain, authority_only = exclude vendor pages and keep high-authority sources.",
+    )
     parser.add_argument("--min-words", type=int, default=20)
     parser.add_argument("--max-words", type=int, default=120)
     parser.add_argument("--similarity-threshold", type=float, default=0.78)
@@ -720,6 +799,7 @@ def main() -> None:
         use_cache=not args.no_cache,
         cache_db_path=Path(args.cache_db_path),
         cache_ttl_days=args.cache_ttl_days,
+        source_policy=args.source_policy,
         min_words=args.min_words,
         max_words=args.max_words,
         similarity_threshold=args.similarity_threshold,

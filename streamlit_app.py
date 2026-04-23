@@ -35,12 +35,12 @@ def resolve_mode(mode: str) -> tuple[int, int, int]:
     return 10, 40, 5
 
 
-def resolve_strictness(level: str) -> tuple[float, int]:
+def resolve_strictness(level: str) -> tuple[float, int, int, int]:
     if level == "Broad":
-        return 0.72, 1
+        return 0.72, 1, 8, 140
     if level == "Strict":
-        return 0.83, 3
-    return 0.78, 2
+        return 0.83, 3, 20, 120
+    return 0.78, 2, 12, 130
 
 run_clicked = st.button("Run Miner", type="primary")
 
@@ -49,7 +49,7 @@ if run_clicked:
         st.error("Please provide a category.")
     else:
         max_results_per_query, max_urls, top_k = resolve_mode(run_mode)
-        similarity_threshold, min_cluster_size = resolve_strictness(strictness)
+        similarity_threshold, min_cluster_size, min_words, max_words = resolve_strictness(strictness)
 
         cfg = Config(
             search_provider=search_provider,
@@ -60,8 +60,8 @@ if run_clicked:
             use_cache=use_cache,
             cache_db_path=Path(".cache/definition_miner.sqlite"),
             cache_ttl_days=14,
-            min_words=20,
-            max_words=120,
+            min_words=min_words,
+            max_words=max_words,
             similarity_threshold=similarity_threshold,
             min_cluster_size=min_cluster_size,
             top_k=top_k,
