@@ -3,7 +3,7 @@
 A Python CLI that mines repeated/canonical definitions for a category (e.g., `CRM`, `ABM`) by:
 
 1. Searching the web for definition-focused queries.
-2. Scraping pages and extracting candidate definition sentences.
+2. Scraping pages with an open-source scraper (`trafilatura`) and extracting candidate definition sentences.
 3. Clustering similar sentences with Hugging Face sentence embeddings + cosine similarity.
 4. Printing top verbatim definitions ranked by multi-site agreement.
 
@@ -12,6 +12,7 @@ No LLM rewriting is used; output sentences are verbatim extracted text.
 ## Features
 
 - **No LLMs** in extraction, clustering, or ranking
+- **Open-source scraper backend** (`trafilatura`) with BeautifulSoup fallback parsing
 - **Verbatim output** (never rewritten)
 - **Domain-level dedup** (`same sentence + same domain` counted once)
 - **Embedding similarity clustering** (Agglomerative + cosine threshold)
@@ -49,6 +50,8 @@ $env:SERPAPI_API_KEY="your_key_here"
 python definition_miner.py CRM
 ```
 
+Output includes tracked source URLs per result under `sources`.
+
 With custom settings:
 
 ```bash
@@ -71,6 +74,44 @@ python definition_miner.py ABM \
 "Customer relationship management (CRM) is a technology for managing ..."
   └─ salesforce.com, hubspot.com, ...
 ```
+
+## FastAPI service
+
+Start API server:
+
+```bash
+uvicorn api_app:app --reload
+```
+
+Endpoints:
+
+- `GET /health`
+- `POST /mine`
+
+Example request:
+
+```json
+{
+  "category": "CRM",
+  "top_k": 5,
+  "similarity_threshold": 0.78
+}
+```
+
+Each result includes:
+
+- `definition` (verbatim sentence)
+- `sources` (list of `{domain, url}` for traceable references)
+
+## Streamlit app
+
+Run:
+
+```bash
+streamlit run streamlit_app.py
+```
+
+The app shows top definitions and an expandable **Sources** section with clickable links for each cluster.
 
 ## Notes
 

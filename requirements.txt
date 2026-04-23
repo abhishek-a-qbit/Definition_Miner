@@ -1,5 +1,9 @@
 beautifulsoup4>=4.12.3
+fastapi>=0.115.0
 numpy>=1.26.4
 requests>=2.32.3
 scikit-learn>=1.5.1
 sentence-transformers>=3.0.1
+streamlit>=1.39.0
+trafilatura>=1.10.0
+uvicorn>=0.31.0

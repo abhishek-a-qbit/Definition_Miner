@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import re
@@ -17,13 +18,11 @@ from urllib.parse import parse_qs, unquote, urlparse
 import numpy as np
 import requests
 from bs4 import BeautifulSoup
-from sentence_transformers import SentenceTransformer
 from sklearn.cluster import AgglomerativeClustering
+import trafilatura
 
 USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
+    "Mozilla/5.0"
 )
 TRIGGER_PHRASES = (
     " is a ",
@@ -111,7 +110,7 @@ def normalize_url(url: str) -> str:
 
 def search_duckduckgo_html(query: str, limit: int, timeout_seconds: int) -> List[str]:
     response = requests.get(
-        "https://duckduckgo.com/html/",
+        "https://html.duckduckgo.com/html/",
         params={"q": query},
         timeout=timeout_seconds,
         headers={"User-Agent": USER_AGENT},
@@ -120,7 +119,78 @@ def search_duckduckgo_html(query: str, limit: int, timeout_seconds: int) -> List
     soup = BeautifulSoup(response.text, "html.parser")
 
     urls: List[str] = []
-    for link in soup.select("a.result__a"):
+    seen = set()
+    selectors = [
+        "a.result__a",
+        "a.result-link",
+        "a[data-testid='result-title-a']",
+        "div.links_main a",
+    ]
+
+    for selector in selectors:
+        for link in soup.select(selector):
+            href = link.get("href", "")
+            if not href:
+                continue
+            if "duckduckgo.com/l/?" in href and "uddg=" in href:
+                query_params = parse_qs(urlparse(href).query)
+                if "uddg" in query_params:
+                    href = unquote(query_params["uddg"][0])
+
+            href = href.strip()
+            if not href.startswith("http"):
+                continue
+            if "duckduckgo.com" in get_domain(href):
+                continue
+            if href in seen:
+                continue
+            seen.add(href)
+            urls.append(href)
+            if len(urls) >= limit:
+                return urls
+
+    return urls
+
+
+def decode_bing_href(href: str) -> str:
+    if not href:
+        return ""
+
+    parsed = urlparse(href)
+    if "bing.com" not in parsed.netloc or not parsed.path.startswith("/ck/a"):
+        return href
+
+    encoded = parse_qs(parsed.query).get("u", [""])[0]
+    if not encoded.startswith("a1"):
+        return href
+
+    token = encoded[2:]
+    token += "=" * ((4 - len(token) % 4) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode(token).decode("utf-8", errors="ignore")
+    except Exception:
+        return href
+
+    if decoded.startswith("http"):
+        return decoded
+    if decoded.startswith("/"):
+        return f"https://www.bing.com{decoded}"
+    return href
+
+
+def search_duckduckgo_lite(query: str, limit: int, timeout_seconds: int) -> List[str]:
+    response = requests.post(
+        "https://lite.duckduckgo.com/lite/",
+        data={"q": query},
+        timeout=timeout_seconds,
+        headers={"User-Agent": USER_AGENT},
+    )
+    response.raise_for_status()
+    soup = BeautifulSoup(response.text, "html.parser")
+
+    urls: List[str] = []
+    seen = set()
+    for link in soup.select("a"):
         href = link.get("href", "")
         if not href:
             continue
@@ -128,8 +198,78 @@ def search_duckduckgo_html(query: str, limit: int, timeout_seconds: int) -> List
             query_params = parse_qs(urlparse(href).query)
             if "uddg" in query_params:
                 href = unquote(query_params["uddg"][0])
-        if href.startswith("http"):
-            urls.append(href)
+        href = href.strip()
+        if not href.startswith("http"):
+            continue
+        if "duckduckgo.com" in get_domain(href):
+            continue
+        if href in seen:
+            continue
+        seen.add(href)
+        urls.append(href)
+        if len(urls) >= limit:
+            break
+    return urls
+
+
+def search_bing_html(query: str, limit: int, timeout_seconds: int) -> List[str]:
+    response = requests.get(
+        "https://www.bing.com/search",
+        params={"q": query, "count": limit},
+        timeout=timeout_seconds,
+        headers={"User-Agent": USER_AGENT},
+    )
+    response.raise_for_status()
+    soup = BeautifulSoup(response.text, "html.parser")
+
+    urls: List[str] = []
+    seen = set()
+    primary_links = soup.select("li.b_algo h2 a")
+    if not primary_links:
+        primary_links = [
+            link
+            for link in soup.select("a[href]")
+            if "bing.com/ck/a" in (link.get("href", ""))
+        ]
+
+    for link in primary_links:
+        href = decode_bing_href(link.get("href", "").strip())
+        if not href.startswith("http"):
+            continue
+        if "bing.com" in get_domain(href):
+            continue
+        if href in seen:
+            continue
+        seen.add(href)
+        urls.append(href)
+        if len(urls) >= limit:
+            break
+    return urls
+
+
+def search_wikipedia(query: str, limit: int, timeout_seconds: int) -> List[str]:
+    response = requests.get(
+        "https://en.wikipedia.org/w/api.php",
+        params={
+            "action": "query",
+            "list": "search",
+            "format": "json",
+            "srsearch": query,
+            "srlimit": limit,
+        },
+        timeout=timeout_seconds,
+        headers={"User-Agent": USER_AGENT},
+    )
+    response.raise_for_status()
+    payload = response.json()
+    rows = payload.get("query", {}).get("search", [])
+
+    urls: List[str] = []
+    for row in rows:
+        title = row.get("title", "").strip()
+        if not title:
+            continue
+        urls.append(f"https://en.wikipedia.org/wiki/{title.replace(' ', '_')}")
         if len(urls) >= limit:
             break
     return urls
@@ -175,28 +315,42 @@ def search_urls(category: str, cfg: Config) -> List[str]:
     brave_key = os.getenv("BRAVE_API_KEY", "").strip()
     serpapi_key = os.getenv("SERPAPI_API_KEY", "").strip()
 
-    provider = cfg.search_provider
-    if provider == "auto":
-        if brave_key:
-            provider = "brave"
-        elif serpapi_key:
-            provider = "serpapi"
-        else:
-            provider = "duckduckgo"
+    def run_provider(provider_name: str, query: str) -> List[str]:
+        if provider_name == "brave":
+            if not brave_key:
+                return []
+            return search_brave(query, cfg.max_results_per_query, cfg.timeout_seconds, brave_key)
+        if provider_name == "serpapi":
+            if not serpapi_key:
+                return []
+            return search_serpapi(query, cfg.max_results_per_query, cfg.timeout_seconds, serpapi_key)
+
+        found = search_duckduckgo_html(query, cfg.max_results_per_query, cfg.timeout_seconds)
+        if not found:
+            found = search_duckduckgo_lite(query, cfg.max_results_per_query, cfg.timeout_seconds)
+        if not found:
+            found = search_bing_html(query, cfg.max_results_per_query, cfg.timeout_seconds)
+        if not found:
+            found = search_wikipedia(query, cfg.max_results_per_query, cfg.timeout_seconds)
+        return found
 
     ordered_urls: List[str] = []
     seen = set()
     for query in queries:
-        try:
-            if provider == "brave":
-                found = search_brave(query, cfg.max_results_per_query, cfg.timeout_seconds, brave_key)
-            elif provider == "serpapi":
-                found = search_serpapi(query, cfg.max_results_per_query, cfg.timeout_seconds, serpapi_key)
-            else:
-                found = search_duckduckgo_html(query, cfg.max_results_per_query, cfg.timeout_seconds)
-        except Exception as exc:
-            print(f"[warn] search failed for query '{query}': {exc}")
-            found = []
+        if cfg.search_provider == "auto":
+            providers = ["brave", "serpapi", "duckduckgo"]
+        else:
+            providers = [cfg.search_provider]
+
+        found: List[str] = []
+        for provider_name in providers:
+            try:
+                found = run_provider(provider_name, query)
+            except Exception as exc:
+                print(f"[warn] search provider '{provider_name}' failed for query '{query}': {exc}")
+                found = []
+            if found:
+                break
 
         for raw_url in found:
             normalized = normalize_url(raw_url)
@@ -268,6 +422,17 @@ def fetch_html(url: str, cfg: Config, conn: Optional[sqlite3.Connection]) -> Opt
         if cached and cached[0] < 400:
             return cached[1]
 
+    # Primary open-source scraper backend.
+    try:
+        downloaded = trafilatura.fetch_url(url)
+        if downloaded:
+            if conn is not None:
+                save_to_cache(conn, url, 200, downloaded)
+            return downloaded
+    except Exception:
+        pass
+
+    # Fallback to raw HTTP fetch for pages trafilatura cannot download.
     try:
         response = requests.get(
             url,
@@ -293,11 +458,27 @@ def clean_text(text: str) -> str:
 
 
 def extract_blocks(html: str) -> List[str]:
+    blocks: List[str] = []
+
+    # Primary open-source extraction backend.
+    try:
+        extracted_text = trafilatura.extract(
+            html,
+            output_format="txt",
+            include_links=False,
+            include_images=False,
+        )
+        if extracted_text:
+            for line in extracted_text.splitlines():
+                txt = clean_text(line)
+                if len(txt) >= 40:
+                    blocks.append(txt)
+    except Exception:
+        pass
+
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup(["script", "style", "noscript", "svg", "footer", "nav", "form"]):
         tag.decompose()
-
-    blocks: List[str] = []
 
     meta_desc = soup.find("meta", attrs={"name": "description"})
     if meta_desc and meta_desc.get("content"):
@@ -359,6 +540,8 @@ def extract_candidates_from_html(html: str, url: str, category: str, cfg: Config
 def cluster_candidates(candidates: Sequence[Candidate], cfg: Config) -> List[ClusterResult]:
     if not candidates:
         return []
+
+    from sentence_transformers import SentenceTransformer
 
     unique_by_domain_sentence: Dict[Tuple[str, str], Candidate] = {}
     for candidate in candidates:
@@ -426,6 +609,12 @@ def cluster_candidates(candidates: Sequence[Candidate], cfg: Config) -> List[Clu
     return results[: cfg.top_k]
 
 
+def build_sources(urls: Sequence[str]) -> List[Dict[str, str]]:
+    sources = [{"domain": get_domain(url), "url": url} for url in urls]
+    sources.sort(key=lambda x: (x["domain"], x["url"]))
+    return sources
+
+
 def mine_definitions(category: str, cfg: Config) -> Dict[str, object]:
     urls = search_urls(category, cfg)
     print(f"[info] collected {len(urls)} unique URLs")
@@ -461,6 +650,7 @@ def mine_definitions(category: str, cfg: Config) -> Dict[str, object]:
                 "unique_domains": cluster.unique_domains,
                 "domains": cluster.domains,
                 "urls": cluster.urls,
+                "sources": build_sources(cluster.urls),
                 "score": round(cluster.score, 4),
                 "centrality": round(cluster.centrality, 4),
             }
